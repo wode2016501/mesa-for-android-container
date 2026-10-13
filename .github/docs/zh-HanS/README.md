@@ -156,3 +156,111 @@ MESA_LOADER_DRIVER_OVERRIDE=kgsl
    <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=lfdevs/mesa-for-android-container&type=date&legend=top-left&sealed_token=-2pLkYNq1aQwJzT6Y1uRCEDJafu_HLcd9hb1VGrC9AFHi5L1fU21UewEFoql9B96-B2_Th981yCh2-JTfhuYnWfcEZy3pynzSJZbRf7wZFfLfxXqRO-dcbgT5JFsZ_qyxdVKBbY9bX_gtmBCB7vhMYejuCdB1r1N3ssXmepoU3JLI4Ds637uH0CXhm_Y" />
  </picture>
 </a>
+
+
+
+
+
+补丁加入
+```c
+static int
+dma_heap_alloc1(uint64_t size)
+{
+   int ret;
+   int dma_heap = open("/dev/dma_heap/system", O_RDONLY);
+
+   if (dma_heap < 0) {
+      int ion_heap = open("/dev/ion", O_RDONLY);
+
+      if (ion_heap < 0)
+         return -1;
+
+      /* 
+       * === MESA ADRENO ONEPLUS 6T COMPATIBILITY BACKPORT START ===
+       * 【1. 强行重构盒子至 32 字节完全体】：完美复制一加 6T (4.9内核) 原厂注册的物理属性
+       * 强行在 len 后面塞入 8 字节的 align，并在最后用冗余字段撑满 32 字节以对齐 0xC0204900 命令号！
+       */
+      struct ion_allocation_data_32 {
+         uint64_t len;             /* 8 字节 */
+         uint64_t align;           /* 8 字节 (高通 4.9 内核自定义加入的对齐参数位) */
+         uint32_t heap_id_mask;    /* 4 字节 */
+         uint32_t flags;           /* 4 字节 */
+         uint32_t handle;          /* 4 字节 (在 4.9 内核成功分配后，用来接收内核吐回的内部句柄 ID) */
+         uint32_t padding;         /* 4 字节 (末尾空白填充，强行凑满 32 字节) */
+      } alloc_data = {
+         .len = size,
+         .align = 0,               /* 原厂要求对齐填 0 */
+         /* 降维全广播掩码：直接强行拉满 0xFFFFFFFF，防止 4.9 内核在底层跳过某些特定物理 Heap */
+         .heap_id_mask = 0xFFFFFFFF,
+         .flags = 0,               /* uncached */
+      };
+
+      /* 
+       * 【2. 呼叫 0xC0204900 暗号】：此时计算出的命令号和一加 6T 的官方系统完全对齐！
+       * 内核在 unlocked_ioctl 中将会绿灯放行，顺利走进原厂 case 并把显存 Handle 写入到 .handle 变量中！
+       */
+      ret = kgsl_pipe_safe_ioctl(ion_heap, _IOWR('I', 0, struct ion_allocation_data_32),
+                      &alloc_data);
+
+      if (ret) {
+         close(ion_heap);
+         return -1;
+      }
+
+      /* 
+       * 【3. 核心换证绝杀 (调用 0xC0084902)】：一加 6T 原厂返回的只是内部 Handle ID，无法直接使用。
+       * 驱动程序必须在下一步紧接着利用原厂定义的结构体去换取真正的标准 Linux dma-buf FD！
+       */
+      struct ion_fd_data {
+          uint32_t handle;         /* 填入刚才拿到的显存树内部 handle ID */
+          int32_t fd;              /* 接收内核转正下发的真实物理描述符 fd */
+      };
+      struct ion_fd_data share_data = {
+          .handle = alloc_data.handle,
+          .fd = -1,
+      };
+
+      /* 计算高通原厂的 ION_IOC_SHARE 命令号 (序列号为 2，大小为 8 字节)，对应 0xC0084902 暗号 */
+      unsigned int ion_share_cmd = _IOWR('I', 2, struct ion_fd_data);
+      ret = kgsl_pipe_safe_ioctl(ion_heap, ion_share_cmd, &share_data);
+
+      close(ion_heap);
+      if (ret || share_data.fd < 0) {
+         /* 如果换证失败，安全返回错误 */
+         return -1;
+      }
+      /* 功德圆满！将两步走完美转正获取到的真正通用显存描述符 fd 奉还给上层 Mesa */
+      return share_data.fd;
+      /* === MESA ADRENO ONEPLUS 6T COMPATIBILITY BACKPORT END === */
+
+   } else {
+      struct dma_heap_allocation_data alloc_data = {
+         .len = size,
+         .fd_flags = O_RDWR | O_CLOEXEC,
+      };
+
+      ret = kgsl_pipe_safe_ioctl(dma_heap, DMA_HEAP_IOCTL_ALLOC, &alloc_data);
+
+      close(dma_heap);
+
+      if (ret)
+         return -1;
+
+      return alloc_data.fd;
+   }
+}
+```
+github.com/lfdevs/mesa-for-android-container/blob/401198fbcf61f74bf7214e1be57f811fc74c8358/src/freedreno/drm/kgsl/kgsl_bo.c#L250
+插入
+```C
+   if (fd < 0) 
+   fd = dma_heap_alloc1(size);
+```
+
+Xfce4 (Xfwm4)
+Xfce4 自带的合成器通常通过图形界面关闭，但如果你需要命令，可以使用 xfconf-query：
+
+```bash
+xfconf-query -c xfwm4 -p /general/use_compositing -s false
+```
+
